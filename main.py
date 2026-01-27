@@ -5,9 +5,20 @@
 Перемещает файлы в папки с названием даты (ГГГГ_ММ_ДД или ДД_ММ_ГГГГ).
 """
 
+import os
+import sys
 import shutil
 from pathlib import Path
 from datetime import datetime
+
+# Путь к плагинам Qt при запуске из exe (PyInstaller)
+if getattr(sys, "frozen", False):
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    for sub in ("PySide6/plugins/platforms", "PySide6/plugins", "platforms"):
+        plugin_path = os.path.join(base, sub)
+        if os.path.isdir(plugin_path):
+            os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = plugin_path
+            break
 
 from PySide6.QtWidgets import (
     QApplication,

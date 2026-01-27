@@ -18,6 +18,7 @@ __pycache__/
 *.egg
 .eggs/
 build/
+dist/
 
 # Временные файлы
 *.log
