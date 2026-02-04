@@ -6,6 +6,7 @@
 """
 
 import os
+import re
 import sys
 import shutil
 from pathlib import Path
@@ -38,6 +39,62 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont
+
+KEY_RENAME_SUBFOLDERS = "rename_subfolders"
+
+# Regular expressions for finding dates in folder names
+DATE_PATTERNS = [
+    re.compile(r'(\d{4})[\._\-](\d{2})[\._\-](\d{2})'),
+    re.compile(r'(\d{2})[\._\-](\d{2})[\._\-](\d{4})'),
+    re.compile(r'(\d{4})(\d{2})(\d{2})'),
+    re.compile(r'(\d{2})(\d{2})(\d{4})'),
+]
+
+FOLDER_FORMAT_YYYY = "YYYY_MM_DD"
+
+
+def extract_date_from_name(name: str) -> tuple[datetime | None, str | None]:
+    """Extracts date from folder name.
+    
+    Returns tuple (date, format_detected):
+    - If date found: (datetime, "YYYY_MM_DD" or "DD_MM_YYYY")
+    - If date not found: (None, None)
+    """
+    for pattern in DATE_PATTERNS:
+        match = pattern.search(name)
+        if match:
+            groups = match.groups()
+            if len(groups) == 3:
+                d1, d2, d3 = int(groups[0]), int(groups[1]), int(groups[2])
+                if d1 >= 2000 and d1 <= 2100 and d2 >= 1 and d2 <= 12 and d3 >= 1 and d3 <= 31:
+                    return datetime(d1, d2, d3), "YYYY_MM_DD"
+                elif d3 >= 2000 and d3 <= 2100 and d2 >= 1 and d2 <= 12 and d1 >= 1 and d1 <= 31:
+                    return datetime(d3, d2, d1), "DD_MM_YYYY"
+    return None, None
+
+
+def format_date(dt: datetime, fmt: str) -> str:
+    """Formats date to string."""
+    if fmt == FOLDER_FORMAT_YYYY:
+        return dt.strftime("%Y_%m_%d")
+    else:
+        return dt.strftime("%d_%m_%Y")
+
+
+def get_unique_folder_name(parent: Path, base_name: str) -> str:
+    """Generates unique folder name, adding suffix on conflict.
+    
+    Returns base_name if folder doesn't exist.
+    Otherwise returns base_name_2, base_name_3, etc.
+    """
+    if not (parent / base_name).exists():
+        return base_name
+    n = 2
+    while True:
+        new_name = f"{base_name}_{n}"
+        if not (parent / new_name).exists():
+            return new_name
+        n += 1
 
 
 def get_file_date(file_path: Path, use_creation: bool = True) -> datetime:
@@ -252,6 +309,71 @@ class Worker(QThread):
             self.finished_error.emit(str(e))
 
 
+class RenameFoldersWorker(QThread):
+    """Worker for renaming folders with dates to a new format."""
+    progress = Signal(int, int)
+    log = Signal(str)
+    finished_success = Signal(str)
+    finished_error = Signal(str)
+
+    def __init__(
+        self,
+        root: Path,
+        target_format: str,
+        rename_subfolders: bool = False,
+    ):
+        super().__init__()
+        self.root = root
+        self.target_format = target_format
+        self.rename_subfolders = rename_subfolders
+
+    def run(self):
+        try:
+            folders = [p for p in self.root.iterdir() if p.is_dir()]
+            if not self.rename_subfolders:
+                folders = [f for f in folders if f.parent == self.root]
+            
+            total = len(folders)
+            renamed = 0
+            skipped = 0
+            errors = []
+
+            for i, folder in enumerate(folders):
+                self.progress.emit(i + 1, total)
+                
+                try:
+                    date, detected_fmt = extract_date_from_name(folder.name)
+                    if date is None:
+                        self.log.emit(f"Пропущена (дата не найдена): {folder.name}")
+                        skipped += 1
+                        continue
+
+                    new_name = format_date(date, self.target_format)
+                    if new_name == folder.name:
+                        self.log.emit(f"Пропущена (уже в нужном формате): {folder.name}")
+                        skipped += 1
+                        continue
+
+                    new_name = get_unique_folder_name(self.root, new_name)
+                    new_path = self.root / new_name
+                    
+                    folder.rename(new_path)
+                    renamed += 1
+                    self.log.emit(f"Переименована: {folder.name} → {new_name}")
+                except Exception as e:
+                    errors.append(f"{folder.name}: {e}")
+                    self.log.emit(f"Ошибка: {folder.name} — {e}")
+
+            report = f"Готово. Переименовано: {renamed} из {total}."
+            if skipped:
+                report += f" Пропущено: {skipped}."
+            if errors:
+                report += f" Ошибок: {len(errors)}."
+            self.finished_success.emit(report)
+        except Exception as e:
+            self.finished_error.emit(str(e))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -262,6 +384,7 @@ class MainWindow(QMainWindow):
         self.root_path: Path | None = None
         self.files_count = 0
         self.worker: Worker | None = None
+        self.rename_worker: RenameFoldersWorker | None = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -325,6 +448,21 @@ class MainWindow(QMainWindow):
         self.btn_move.setEnabled(False)
         layout.addWidget(self.btn_move)
 
+        # --- Переименовать папки ---
+        grp_rename = QGroupBox("Переименование папок с датами")
+        rename_layout = QVBoxLayout(grp_rename)
+        
+        self.check_rename_subfolders = QCheckBox("Обрабатывать подпапки")
+        self.check_rename_subfolders.setChecked(False)
+        rename_layout.addWidget(self.check_rename_subfolders)
+        
+        self.btn_rename = QPushButton("Переименовать папки")
+        self.btn_rename.clicked.connect(self.start_rename)
+        self.btn_rename.setEnabled(False)
+        rename_layout.addWidget(self.btn_rename)
+        
+        layout.addWidget(grp_rename)
+
         # --- Прогресс ---
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -351,6 +489,7 @@ class MainWindow(QMainWindow):
             self.label_path.setText(str(self.root_path))
             self._recount_files()
             self.btn_move.setEnabled(self.files_count > 0)
+            self.btn_rename.setEnabled(True)
 
     def _recount_files(self):
         if self.root_path is None or not self.root_path.is_dir():
@@ -444,6 +583,85 @@ class MainWindow(QMainWindow):
         self.check_by_extension.setEnabled(True)
         self.check_by_size.setEnabled(True)
         self.check_delete_empty.setEnabled(True)
+        QMessageBox.critical(self, "Ошибка", err)
+
+    def start_rename(self):
+        if not self.root_path:
+            return
+        
+        fmt_index = self.combo_format.currentIndex()
+        target_format = "YYYY_MM_DD" if fmt_index == 0 else "DD_MM_YYYY"
+        rename_subfolders = self.check_rename_subfolders.isChecked()
+        
+        msg = (
+            f"Будут переименованы папки с датами в формат {target_format}.\n\n"
+            "При совпадении имён будет добавлен суффикс _2, _3 и т.д.\n\n"
+            "Продолжить?"
+        )
+        r = QMessageBox.question(
+            self,
+            "Подтверждение",
+            msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if r != QMessageBox.StandardButton.Yes:
+            return
+
+        self.report.clear()
+        self.report.append("Запуск переименования папок…")
+        self.progress.setValue(0)
+        self.btn_move.setEnabled(False)
+        self.btn_rename.setEnabled(False)
+        self.btn_choose.setEnabled(False)
+        self.check_subfolders.setEnabled(False)
+        self.check_by_extension.setEnabled(False)
+        self.check_by_size.setEnabled(False)
+        self.check_delete_empty.setEnabled(False)
+        self.check_rename_subfolders.setEnabled(False)
+
+        self.rename_worker = RenameFoldersWorker(
+            self.root_path,
+            target_format,
+            rename_subfolders=rename_subfolders,
+        )
+        self.rename_worker.progress.connect(self._on_rename_progress)
+        self.rename_worker.log.connect(self._on_rename_log)
+        self.rename_worker.finished_success.connect(self._on_rename_finished)
+        self.rename_worker.finished_error.connect(self._on_rename_error)
+        self.rename_worker.start()
+
+    def _on_rename_progress(self, current: int, total: int):
+        if total > 0:
+            self.progress.setValue(int(100 * current / total))
+
+    def _on_rename_log(self, text: str):
+        self.report.append(text)
+
+    def _on_rename_finished(self, msg: str):
+        self.progress.setValue(100)
+        self.report.append("")
+        self.report.append(msg)
+        self.btn_move.setEnabled(True)
+        self.btn_rename.setEnabled(True)
+        self.btn_choose.setEnabled(True)
+        self.check_subfolders.setEnabled(True)
+        self.check_by_extension.setEnabled(True)
+        self.check_by_size.setEnabled(True)
+        self.check_delete_empty.setEnabled(True)
+        self.check_rename_subfolders.setEnabled(True)
+        QMessageBox.information(self, "Готово", msg)
+
+    def _on_rename_error(self, err: str):
+        self.report.append(f"Ошибка: {err}")
+        self.btn_move.setEnabled(True)
+        self.btn_rename.setEnabled(True)
+        self.btn_choose.setEnabled(True)
+        self.check_subfolders.setEnabled(True)
+        self.check_by_extension.setEnabled(True)
+        self.check_by_size.setEnabled(True)
+        self.check_delete_empty.setEnabled(True)
+        self.check_rename_subfolders.setEnabled(True)
         QMessageBox.critical(self, "Ошибка", err)
 
 
